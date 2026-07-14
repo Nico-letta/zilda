@@ -4,6 +4,7 @@ use tokio::time::{sleep, Duration};
 use crate::memory::KVCacheManager;
 use crate::backend::ZildaLinearBackend;
 use candle_core::Tensor;
+use tokenizers::Tokenizer;
 
 pub struct InferenceRequest {
     pub request_id: String,
@@ -12,44 +13,74 @@ pub struct InferenceRequest {
     pub tx_token: mpsc::Sender<String>,
 }
 
+// Pour suivre l'état de chaque requête en cours de traitement dans le batch actif
+struct ActiveQuery {
+    request_id: String,
+    prompt_tokens: Vec<u32>,
+    generated_tokens: Vec<u32>,
+    tx_token: mpsc::Sender<String>,
+}
+
 pub struct ZildaOrchestrator {
     pub cache_manager: Arc<Mutex<KVCacheManager>>,
     pub tx_queue: mpsc::Sender<InferenceRequest>,
+    pub tokenizer: Arc<Tokenizer>,
 }
 
 impl ZildaOrchestrator {
-    pub fn new(total_blocks: usize, block_size: usize) -> (Self, mpsc::Receiver<InferenceRequest>) {
+    pub fn new(total_blocks: usize, block_size: usize, tokenizer: Arc<Tokenizer>) -> (Self, mpsc::Receiver<InferenceRequest>) {
         let manager = KVCacheManager::new(total_blocks, block_size);
         let (tx, rx) = mpsc::channel(100);
 
         let orchestrator = ZildaOrchestrator {
             cache_manager: Arc::new(Mutex::new(manager)),
             tx_queue: tx,
+            tokenizer,
         };
 
         (orchestrator, rx)
     }
 
-    pub async fn enqueue_request(&self, request: InferenceRequest) -> Result<(), String> {
-        self.tx_queue.send(request).await
-            .map_err(|_| "Impossible d'accéder à la file d'attente centrale.".to_string())
-    }
-
     pub async fn run_engine_loop(
         cache_manager: Arc<Mutex<KVCacheManager>>, 
-        backend: Arc<Mutex<ZildaLinearBackend>>, // Utilisation d'un Mutex ici car forward_attention est mutable
+        backend: Arc<Mutex<ZildaLinearBackend>>, 
+        tokenizer: Arc<Tokenizer>, // On passe aussi le tokenizer à la boucle d'inférence
         mut rx_queue: mpsc::Receiver<InferenceRequest>
     ) {
-        println!("[Moteur Core] Boucle d'exécution centralisée Candle démarrée.");
-        let mut active_batch: Vec<InferenceRequest> = Vec::new();
+        println!("[Moteur Core] Boucle d'inférence en Continuous Batching active.");
+        let mut active_batch: Vec<ActiveQuery> = Vec::new();
 
         loop {
+            // 1. INJECTION DYNAMIQUE
             while let Ok(req) = rx_queue.try_recv() {
-                let mut manager = cache_manager.lock().await;
-                if manager.allocate_slots(&req.request_id, req.estimated_tokens).is_ok() {
-                    active_batch.push(req);
-                } else {
-                    let _ = req.tx_token.send("[ERREUR] VRAM saturée (OOM)".to_string()).await;
+                // Utilisation du vrai tokenizer MUNTU pour encoder le prompt !
+                match tokenizer.encode(req.prompt.clone(), true) {
+                    Ok(encoding) => {
+                        let token_ids = encoding.get_ids().to_vec();
+                        let num_tokens = token_ids.len();
+                        
+                        // Allocation dynamique basée sur la vraie taille du prompt + une marge pour la génération
+                        let reserve_size = num_tokens + req.estimated_tokens;
+                        let mut manager = cache_manager.lock().await;
+
+                        if manager.allocate_slots(&req.request_id, reserve_size).is_ok() {
+                            println!(
+                                "[Scheduler] Nouvelle requête intégrée (Prompt: {} tokens, Réservé: {}): {}", 
+                                num_tokens, reserve_size, req.request_id
+                            );
+                            active_batch.push(ActiveQuery {
+                                request_id: req.request_id,
+                                prompt_tokens: token_ids,
+                                generated_tokens: Vec::new(),
+                                tx_token: req.tx_token,
+                            });
+                        } else {
+                            let _ = req.tx_token.send("[ERREUR] VRAM saturée (OOM) - Impossible d'allouer le cache".to_string()).await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = req.tx_token.send(format!("[ERREUR] Échec de la tokenisation : {}", e)).await;
+                    }
                 }
             }
 
@@ -58,53 +89,55 @@ impl ZildaOrchestrator {
                 continue;
             }
 
-            let batch_size = active_batch.len();
-            println!("\n[Continuous Batching] Calcul de l'attention pour {} requêtes actives...", batch_size);
-
-            let mut finished_requests = Vec::new();
+            // 2. ÉTAPE D'ATTENTION (1 token par requête active)
+            let mut finished_requests_indices = Vec::new();
             let mut manager = cache_manager.lock().await;
             let mut model = backend.lock().await;
 
-            for (idx, req) in active_batch.iter_mut().enumerate() {
-                // Création d'un état d'entrée simulé [1, 512] conforme au backend
+            println!("[Batching] Itération d'attention sur {} requêtes...", active_batch.len());
+
+            for (idx, query) in active_batch.iter_mut().enumerate() {
+                // Simulation de l'état caché de l'input [1, 512]
                 if let Ok(input_state) = Tensor::randn(0f32, 1f32, (1, 512), model.device()) {
                     
-                    // Exécution réelle de la passe d'attention
-                    if let Ok(_logits) = model.forward_attention(&input_state, &req.request_id, &manager) {
-                        let simulated_token_id = rand::random::<u32>() % 256;
-                        
-                        let simulated_word = match simulated_token_id % 5 {
-                            0 => "Zilda_Core ",
-                            1 => "Attention ",
-                            2 => "KV_Cache ",
-                            3 => "Optimisé ",
-                            _ => "Rust_Power ",
+                    if let Ok(_logits) = model.forward_attention(&input_state, &query.request_id, &manager) {
+                        // Pour l'instant, on simule la sélection d'un ID de token valide (dans la limite du vocabulaire de 8000)
+                        // On évite le token 0 (souvent [PAD] ou [UNK]) pour avoir des caractères visibles
+                        let next_token_id = (rand::random::<u32>() % 7900) + 100; 
+
+                        // On décode le token ID en texte brut via le tokenizer de MUNTU !
+                        let decoded_word = match tokenizer.decode(&[next_token_id], true) {
+                            Ok(text) => text,
+                            Err(_) => " ".to_string(),
                         };
 
-                        let output_token = format!("{}(block_kv) ", simulated_word);
-
-                        if req.tx_token.send(output_token).await.is_err() {
-                            finished_requests.push(idx);
+                        // Envoi du vrai token décodé au client HTTP
+                        if query.tx_token.send(decoded_word).await.is_err() {
+                            println!("[Scheduler] Client déconnecté : {}", query.request_id);
+                            finished_requests_indices.push(idx);
                             continue;
                         }
 
-                        if rand::random::<f32>() > 0.88 {
-                            let _ = req.tx_token.send("\n[Fin d'attention]".to_string()).await;
-                            finished_requests.push(idx);
+                        query.generated_tokens.push(next_token_id);
+
+                        // Arrêt si la génération dépasse la taille allouée ou par probabilité (simulant un EOS)
+                        if query.generated_tokens.len() >= 30 || rand::random::<f32>() > 0.90 {
+                            let _ = query.tx_token.send("\n[Fin d'attention]".to_string()).await;
+                            finished_requests_indices.push(idx);
                         }
+                    } else {
+                        finished_requests_indices.push(idx);
                     }
                 }
             }
 
-            for idx in finished_requests.into_iter().rev() {
-                if idx < active_batch.len() {
-                    let completed = active_batch.remove(idx);
-                    manager.free_slots(&completed.request_id);
-                    println!("[Memory Cache] Blocs physiques libérés pour : {}", completed.request_id);
-                }
+            for idx in finished_requests_indices.into_iter().rev() {
+                let completed = active_batch.remove(idx);
+                manager.free_slots(&completed.request_id);
+                println!("[Memory Cache] Requête {} finalisée. Blocs de mémoire libérés.", completed.request_id);
             }
 
-            sleep(Duration::from_millis(150)).await;
+            sleep(Duration::from_millis(100)).await;
         }
     }
 }
