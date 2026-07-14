@@ -1,0 +1,6 @@
+﻿[workspace]
+members = [
+    "zilda-core",
+    "zilda-python"
+]
+resolver = "2"

@@ -1,0 +1,14 @@
+[package]
+name = "zilda-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.52.3", features = ["full"] }
+candle-core = { version = "0.11.0" }
+axum = "0.8.9"
+rand = "0.10.2"
+serde = { version = "1.0.228", features = ["derive"] }
+futures-util = "0.3.32"
+async-stream = "0.3.6"
+candle-nn = "0.11.0"

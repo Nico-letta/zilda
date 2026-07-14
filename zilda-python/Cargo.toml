@@ -1,0 +1,13 @@
+﻿[package]
+name = "zilda-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "zilda_bindings"
+# cdylib est requis pour que Python puisse charger le fichier comme une DLL dynamique (.pyd sur Windows)
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+zilda-core = { path = "../zilda-core" }
