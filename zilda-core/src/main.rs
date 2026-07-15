@@ -6,9 +6,13 @@ mod backend;
 mod api;
 
 use orchestrator::ZildaOrchestrator;
-use backend::ZildaLinearBackend;
+use backend::ZildaMoeBackend;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+// --- IMPORTS POUR LE BYTE-LEVEL ---
+use tokenizers::pre_tokenizers::byte_level::ByteLevel as PreByteLevel;
+use tokenizers::decoders::byte_level::ByteLevel as DecByteLevel;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,14 +28,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .map_err(|e| format!("Erreur lors de la lecture des fichiers BPE MUNTU : {}", e))?;
 
-    let tokenizer = tokenizers::Tokenizer::new(bpe);
+    let mut tokenizer = tokenizers::Tokenizer::new(bpe);
+
+    // Correction ici : utilisation de "with_" et wrapping dans "Some()"
+    tokenizer.with_pre_tokenizer(Some(PreByteLevel::default()));
+    tokenizer.with_decoder(Some(DecByteLevel::default()));
+
     let tokenizer = Arc::new(tokenizer);
     println!("[Système] Tokenizer BPE chargé avec succès. Taille du vocabulaire : {}", tokenizer.get_vocab_size(true));
 
     let total_blocks = 40;
     let block_size = 16;
 
-    let backend = Arc::new(Mutex::new(ZildaLinearBackend::new(512, 256)?));
+    let weights_path = "../data/muntu_pretrained.safetensors";
+    let backend = Arc::new(Mutex::new(ZildaMoeBackend::new(weights_path)?));
     
     let (orchestrator, rx_queue) = ZildaOrchestrator::new(total_blocks, block_size, Arc::clone(&tokenizer));
     let orchestrator = Arc::new(orchestrator);
