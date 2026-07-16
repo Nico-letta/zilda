@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::collections::HashSet; // <-- Ajouté pour la déduplication rapide des tokens générés
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, Duration};
 use crate::memory::KVCacheManager;
@@ -11,6 +12,10 @@ pub struct InferenceRequest {
     pub prompt: String,
     pub estimated_tokens: usize,
     pub tx_token: mpsc::Sender<String>,
+    // Paramètres dynamiques optionnels envoyés par l'utilisateur
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub repetition_penalty: Option<f32>,
 }
 
 struct ActiveQuery {
@@ -18,6 +23,9 @@ struct ActiveQuery {
     prompt_tokens: Vec<u32>,
     generated_tokens: Vec<u32>,
     tx_token: mpsc::Sender<String>,
+    temperature: f32,
+    top_p: f32,
+    repetition_penalty: f32,
 }
 
 pub struct ZildaOrchestrator {
@@ -40,25 +48,95 @@ impl ZildaOrchestrator {
         (orchestrator, rx)
     }
 
-    fn sample_next_token(logits: &[f32], temperature: f32) -> u32 {
+    fn sample_next_token(
+        logits: &[f32],
+        temperature: f32,
+        top_p: f32,
+        repetition_penalty: f32,
+        generated_tokens: &[u32],
+    ) -> u32 {
+        let mut logits_clone = logits.to_vec();
+
+        // 1. Appliquer la Repetition Penalty (uniquement sur les tokens déjà générés)
+        if repetition_penalty != 1.0 && !generated_tokens.is_empty() {
+            let unique_tokens: HashSet<&u32> = generated_tokens.iter().collect();
+            for &&token_id in &unique_tokens {
+                let idx = token_id as usize;
+                if idx < logits_clone.len() {
+                    let logit = logits_clone[idx];
+                    if logit > 0.0 {
+                        logits_clone[idx] = logit / repetition_penalty;
+                    } else {
+                        logits_clone[idx] = logit * repetition_penalty;
+                    }
+                }
+            }
+        }
+
+        // 2. Mode Glouton (Greedy Search) si la température est nulle ou négative
         if temperature <= 0.0 {
-            return logits.iter()
+            return logits_clone.iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as u32)
                 .unwrap_or(0);
         }
-    
-        let logits: Vec<f32> = logits.iter().map(|&l| l / temperature).collect();
-    
-        let max_logit = *logits.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-        let exp_logits: Vec<f32> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
-        let sum_exp: f32 = exp_logits.iter().sum();
-        let probs: Vec<f32> = exp_logits.iter().map(|&e| e / sum_exp).collect();
 
+        // 3. Appliquer la Température aux Logits
+        for logit in logits_clone.iter_mut() {
+            *logit /= temperature;
+        }
+
+        // 4. Préparer le Top-P (Nucleus Sampling)
+        // On associe l'index d'origine au logit pour ne pas perdre la correspondance après le tri
+        let mut indexed_logits: Vec<(usize, f32)> = logits_clone.into_iter().enumerate().collect();
+        
+        // Tri décroissant basé sur les logits
+        indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Calcul du Softmax sur les éléments triés
+        let max_logit = indexed_logits[0].1;
+        let exp_logits: Vec<f32> = indexed_logits.iter().map(|(_, l)| (l - max_logit).exp()).collect();
+        let sum_exp: f32 = exp_logits.iter().sum();
+        let mut probs: Vec<f32> = exp_logits.iter().map(|&e| e / sum_exp).collect();
+
+        // 5. Filtrage Top-P (Nucleus)
+        if top_p > 0.0 && top_p < 1.0 {
+            let mut cumulative_prob = 0.0;
+            let mut cutoff_idx = probs.len();
+
+            for (i, &p) in probs.iter().enumerate() {
+                cumulative_prob += p;
+                if cumulative_prob > top_p {
+                    cutoff_idx = i + 1; // On conserve le token qui franchit le seuil, puis on coupe
+                    break;
+                }
+            }
+
+            indexed_logits.truncate(cutoff_idx);
+            probs.truncate(cutoff_idx);
+
+            // Renormalisation des probabilités restantes
+            let sum_probs: f32 = probs.iter().sum();
+            if sum_probs > 0.0 {
+                for p in probs.iter_mut() {
+                    *p /= sum_probs;
+                }
+            } else {
+                probs = vec![1.0];
+                indexed_logits.truncate(1);
+            }
+        }
+
+        // 6. Échantillonnage final via sélection pondérée
         let mut rng = rand::rng(); 
-        let dist = WeightedIndex::new(&probs).unwrap(); 
-        dist.sample(&mut rng) as u32
+        if let Ok(dist) = WeightedIndex::new(&probs) {
+            let sampled_idx = dist.sample(&mut rng);
+            indexed_logits[sampled_idx].0 as u32
+        } else {
+            // Fallback de secours sur le token le plus probable
+            indexed_logits[0].0 as u32
+        }
     }
 
     pub async fn run_engine_loop(
@@ -86,6 +164,10 @@ impl ZildaOrchestrator {
                             prompt_tokens: tokens,
                             generated_tokens: Vec::new(),
                             tx_token: req.tx_token,
+                            // Assignation des paramètres avec des valeurs par défaut robustes
+                            temperature: req.temperature.unwrap_or(0.7),
+                            top_p: req.top_p.unwrap_or(0.9),
+                            repetition_penalty: req.repetition_penalty.unwrap_or(1.15),
                         });
                     }
                     Err(err_msg) => {
@@ -137,7 +219,14 @@ impl ZildaOrchestrator {
                         if let Ok(logits_vec) = logits.to_vec2::<f32>() {
                             let step_logits = &logits_vec[0];
                             
-                            let next_token_id = Self::sample_next_token(step_logits, 0.7);
+                            // Utilisation de notre nouveau Sampler configuré à la volée !
+                            let next_token_id = Self::sample_next_token(
+                                step_logits,
+                                query.temperature,
+                                query.top_p,
+                                query.repetition_penalty,
+                                &query.generated_tokens
+                            );
 
                             let prev_text = tokenizer.decode(&query.generated_tokens, true).unwrap_or_default();
 
@@ -147,6 +236,7 @@ impl ZildaOrchestrator {
 
                             let decoded_word = if new_text.len() > prev_text.len() {
                                 new_text[prev_text.len()..].to_string()
+                                // Remplacement éventuel des caractères de contrôle du byte-level
                             } else {
                                 String::new()
                             };
@@ -158,7 +248,7 @@ impl ZildaOrchestrator {
                                 }
                             }
 
-                            if query.generated_tokens.len() >= 30 || next_token_id == 0 {
+                            if query.generated_tokens.len() >= 60 || next_token_id == 0 {
                                 let _ = query.tx_token.send("\n[Fin d'attention]".to_string()).await;
                                 finished_requests_indices.push(idx);
                             }

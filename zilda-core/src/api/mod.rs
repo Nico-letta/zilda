@@ -16,6 +16,10 @@ pub struct ApiPromptRequest {
     pub prompt: String,
     #[serde(default)]
     pub _stream: Option<bool>,
+    // Ajout des paramètres pour piloter notre Sampler à chaud
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub repetition_penalty: Option<f32>,
 }
 
 pub struct ApiState {
@@ -48,11 +52,15 @@ async fn handle_chat_completion(
     let (tx_token, mut rx_token) = mpsc::channel::<String>(50);
     let request_id = format!("REQ_HTTP_{}", rand::random::<u32>());
 
+    // On passe directement les options à l'orchestrateur
     let internal_request = InferenceRequest {
         request_id,
         prompt: payload.prompt,
         estimated_tokens: 32,
         tx_token,
+        temperature: payload.temperature,
+        top_p: payload.top_p,
+        repetition_penalty: payload.repetition_penalty,
     };
 
     if state.tx_queue.send(internal_request).await.is_err() {

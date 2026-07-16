@@ -139,21 +139,28 @@ impl ZildaMoeBackend {
         request_id: &str,
         cache_manager: &KVCacheManager,
     ) -> Result<Tensor> {
-        // 1. Passage dans l'Embedding [1, 768]
+        // 1. Embedding
         let input_tensor = Tensor::new(&[token_id], &self.device)?;
         let mut x = self.token_embedding.forward(&input_tensor)?;
-
-        // --- BLOC 0 ---
-
+    
         // A. Normalisation pré-attention
         let norm_x_attn = x.apply(&self.ln1)?;
-
-        // B. Projections Attention Q, K, V
+    
+        // B. Projections Q, K, V (on reste en [1, 768] pour l'instant)
         let q = norm_x_attn.apply(&self.q_proj)?; 
         let mut k = norm_x_attn.apply(&self.k_proj)?;
         let mut v = norm_x_attn.apply(&self.v_proj)?;
-
-        // C. Concaténation active du KV Cache
+    
+        // --- ICI : On calcule la position ---
+        let pos = if let Some(allocated_blocks) = cache_manager.table_de_pages.get(request_id) {
+            if let Some(&current_block_id) = allocated_blocks.first() {
+                if let Some((past_k, _)) = self.vram_kv_store.get(&current_block_id) {
+                    past_k.dim(0)? 
+                } else { 0 }
+            } else { 0 }
+        } else { 0 };
+    
+        // C. Concaténation KV Cache
         if let Some(allocated_blocks) = cache_manager.table_de_pages.get(request_id) {
             if let Some(&current_block_id) = allocated_blocks.first() {
                 if let Some((past_k, past_v)) = self.vram_kv_store.get(&current_block_id) {
@@ -163,24 +170,31 @@ impl ZildaMoeBackend {
                 self.vram_kv_store.insert(current_block_id, (k.clone(), v.clone()));
             }
         }
-
-        // D. Attention sur le contexte complet
-        let scale = 1.0 / ((q.dim(1)? as f64).sqrt());
+    
+        // --- ICI : Reshape et Transpose pour le Multi-Head Attention ---
+        // On passe de [SeqLen, 768] à [12, SeqLen, 64]
+        let num_heads = 12;
+        let head_dim = 64;
         
-        // Calcul des scores d'attention
-        let scores = q.matmul(&k.t()?)?.affine(scale, 0.0)?;
-        
-        // Calcul des poids d'attention (Softmax)
-        let attention_weights = candle_nn::ops::softmax(&scores, 1)?;
-        
-        // Calcul du contexte
-        let context = attention_weights.matmul(&v)?;
-
-        // Projection de sortie
-        let attn_out = context.apply(&self.out_proj)?; 
-
-        // Addition résiduelle (Utilisation explicite de .add pour éviter les erreurs de type)
+        // Q reste en [1, 768] ou [1, 12, 64] car c'est le token actuel
+        let q = q.reshape((1, num_heads, head_dim))?.transpose(0, 1)?; // -> [12, 1, 64]
+        let k = k.reshape((k.dim(0)?, num_heads, head_dim))?.transpose(0, 1)?; // -> [12, SeqLen, 64]
+        let v = v.reshape((v.dim(0)?, num_heads, head_dim))?.transpose(0, 1)?; // -> [12, SeqLen, 64]
+    
+        // D. Attention
+        // Maintenant, le matmul va se faire tête par tête
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores = q.matmul(&k.transpose(1, 2)?)?.affine(scale, 0.0)?;
+        let attention_weights = candle_nn::ops::softmax(&scores, 2)?; // Softmax sur la dernière dim
+        let context = attention_weights.matmul(&v)?; // [12, 1, 64]
+    
+        // On re-concatène les têtes (Flatten) pour revenir à [1, 768]
+        let attn_out = context.transpose(0, 1)?.reshape((1, 768))?;
+        let attn_out = attn_out.apply(&self.out_proj)?; 
+    
+        // ... suite avec add residual, MoE, etc.
         x = x.add(&attn_out)?;
+        // ...
 
         // --- Reste du bloc MoE ---
         let norm_x_moe = x.apply(&self.ln2)?;
