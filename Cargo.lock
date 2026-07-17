@@ -32,6 +32,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "anyhow"
+version = "1.0.103"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2043,11 +2049,13 @@ dependencies = [
 name = "zilda-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "axum",
  "candle-core",
  "candle-nn",
  "futures-util",
+ "memmap2",
  "rand 0.10.2",
  "serde",
  "tokenizers 0.23.1",

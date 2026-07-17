@@ -52,7 +52,6 @@ async fn handle_chat_completion(
     let (tx_token, mut rx_token) = mpsc::channel::<String>(50);
     let request_id = format!("REQ_HTTP_{}", rand::random::<u32>());
 
-    // On passe directement les options à l'orchestrateur
     let internal_request = InferenceRequest {
         request_id,
         prompt: payload.prompt,

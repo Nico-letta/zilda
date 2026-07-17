@@ -9,6 +9,7 @@ use orchestrator::ZildaOrchestrator;
 use backend::ZildaMoeBackend;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use candle_core::Device; // <-- Ajout de l'import Device pour Candle
 
 // --- IMPORTS POUR LE BYTE-LEVEL ---
 use tokenizers::pre_tokenizers::byte_level::ByteLevel as PreByteLevel;
@@ -30,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tokenizer = tokenizers::Tokenizer::new(bpe);
 
-    // Correction ici : utilisation de "with_" et wrapping dans "Some()"
+    // Ta configuration Byte-Level personnalisée
     tokenizer.with_pre_tokenizer(Some(PreByteLevel::default()));
     tokenizer.with_decoder(Some(DecByteLevel::default()));
 
@@ -40,9 +41,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_blocks = 40;
     let block_size = 16;
 
-    let weights_path = "../data/muntu_pretrained.safetensors";
-    let backend = Arc::new(Mutex::new(ZildaMoeBackend::new(weights_path)?));
+    // --- CONFIGURATION CANDLE & BACKEND QUANTIFIÉ ---
+    // 1. Choix du device (Cpu par défaut, bascule sur Cuda si tu as configuré les features)
+    let device = Device::Cpu; 
     
+    // 2. Changement d'extension pour correspondre au loader GGUF quantifié
+    let weights_path = "../data/muntu_pretrained.safetensors"; 
+    
+    // 3. Initialisation via la méthode de chargement dédiée
+    // Dans main.rs
+    let backend = Arc::new(Mutex::new(ZildaMoeBackend::load(
+        weights_path, 
+        &device, 
+        4,   // num_layers
+        4,   // num_experts
+        12,  // num_heads (au lieu de 32)
+        64,  // head_dim (au lieu de 128)
+        2    // num_experts_per_tok
+    )?));
+    
+    // --- PILOTAGE DE L'ORCHESTRATEUR ---
     let (orchestrator, rx_queue) = ZildaOrchestrator::new(total_blocks, block_size, Arc::clone(&tokenizer));
     let orchestrator = Arc::new(orchestrator);
 

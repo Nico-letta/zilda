@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::collections::HashSet; // <-- Ajouté pour la déduplication rapide des tokens générés
+use std::collections::HashSet;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, Duration};
 use crate::memory::KVCacheManager;
@@ -12,7 +12,7 @@ pub struct InferenceRequest {
     pub prompt: String,
     pub estimated_tokens: usize,
     pub tx_token: mpsc::Sender<String>,
-    // Paramètres dynamiques optionnels envoyés par l'utilisateur
+
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub repetition_penalty: Option<f32>,
@@ -57,7 +57,6 @@ impl ZildaOrchestrator {
     ) -> u32 {
         let mut logits_clone = logits.to_vec();
 
-        // 1. Appliquer la Repetition Penalty (uniquement sur les tokens déjà générés)
         if repetition_penalty != 1.0 && !generated_tokens.is_empty() {
             let unique_tokens: HashSet<&u32> = generated_tokens.iter().collect();
             for &&token_id in &unique_tokens {
@@ -73,7 +72,6 @@ impl ZildaOrchestrator {
             }
         }
 
-        // 2. Mode Glouton (Greedy Search) si la température est nulle ou négative
         if temperature <= 0.0 {
             return logits_clone.iter()
                 .enumerate()
@@ -82,25 +80,19 @@ impl ZildaOrchestrator {
                 .unwrap_or(0);
         }
 
-        // 3. Appliquer la Température aux Logits
         for logit in logits_clone.iter_mut() {
             *logit /= temperature;
         }
 
-        // 4. Préparer le Top-P (Nucleus Sampling)
-        // On associe l'index d'origine au logit pour ne pas perdre la correspondance après le tri
         let mut indexed_logits: Vec<(usize, f32)> = logits_clone.into_iter().enumerate().collect();
-        
-        // Tri décroissant basé sur les logits
+
         indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Calcul du Softmax sur les éléments triés
         let max_logit = indexed_logits[0].1;
         let exp_logits: Vec<f32> = indexed_logits.iter().map(|(_, l)| (l - max_logit).exp()).collect();
         let sum_exp: f32 = exp_logits.iter().sum();
         let mut probs: Vec<f32> = exp_logits.iter().map(|&e| e / sum_exp).collect();
 
-        // 5. Filtrage Top-P (Nucleus)
         if top_p > 0.0 && top_p < 1.0 {
             let mut cumulative_prob = 0.0;
             let mut cutoff_idx = probs.len();
@@ -108,7 +100,7 @@ impl ZildaOrchestrator {
             for (i, &p) in probs.iter().enumerate() {
                 cumulative_prob += p;
                 if cumulative_prob > top_p {
-                    cutoff_idx = i + 1; // On conserve le token qui franchit le seuil, puis on coupe
+                    cutoff_idx = i + 1; 
                     break;
                 }
             }
@@ -116,7 +108,6 @@ impl ZildaOrchestrator {
             indexed_logits.truncate(cutoff_idx);
             probs.truncate(cutoff_idx);
 
-            // Renormalisation des probabilités restantes
             let sum_probs: f32 = probs.iter().sum();
             if sum_probs > 0.0 {
                 for p in probs.iter_mut() {
@@ -128,13 +119,11 @@ impl ZildaOrchestrator {
             }
         }
 
-        // 6. Échantillonnage final via sélection pondérée
         let mut rng = rand::rng(); 
         if let Ok(dist) = WeightedIndex::new(&probs) {
             let sampled_idx = dist.sample(&mut rng);
             indexed_logits[sampled_idx].0 as u32
         } else {
-            // Fallback de secours sur le token le plus probable
             indexed_logits[0].0 as u32
         }
     }
@@ -164,7 +153,6 @@ impl ZildaOrchestrator {
                             prompt_tokens: tokens,
                             generated_tokens: Vec::new(),
                             tx_token: req.tx_token,
-                            // Assignation des paramètres avec des valeurs par défaut robustes
                             temperature: req.temperature.unwrap_or(0.7),
                             top_p: req.top_p.unwrap_or(0.9),
                             repetition_penalty: req.repetition_penalty.unwrap_or(1.15),
@@ -187,10 +175,8 @@ impl ZildaOrchestrator {
             let mut model = backend.lock().await;
 
             for (idx, query) in active_batch.iter_mut().enumerate() {
-                
-                // Détermination de la phase : Prefill vs Decoding
+
                 let logits_result = if query.generated_tokens.is_empty() {
-                    // --- PHASE DE PREFILL ---
                     let mut final_logits = None;
                     let mut err = None;
 
@@ -207,7 +193,8 @@ impl ZildaOrchestrator {
                     if let Some(e) = err {
                         Err(e)
                     } else {
-                        final_logits.ok_or_else(|| candle_core::Error::Msg("Prompt vide".to_string()))
+                        // Remplacé candle_core::Error::Msg par anyhow::anyhow!
+                        final_logits.ok_or_else(|| anyhow::anyhow!("Prompt vide"))
                     }
                 } else {
                     let input_token_id = *query.generated_tokens.last().unwrap();
@@ -218,8 +205,7 @@ impl ZildaOrchestrator {
                     Ok(logits) => {
                         if let Ok(logits_vec) = logits.to_vec2::<f32>() {
                             let step_logits = &logits_vec[0];
-                            
-                            // Utilisation de notre nouveau Sampler configuré à la volée !
+
                             let next_token_id = Self::sample_next_token(
                                 step_logits,
                                 query.temperature,
@@ -235,8 +221,12 @@ impl ZildaOrchestrator {
                             let new_text = tokenizer.decode(&query.generated_tokens, true).unwrap_or_default();
 
                             let decoded_word = if new_text.len() > prev_text.len() {
-                                new_text[prev_text.len()..].to_string()
-                                // Remplacement éventuel des caractères de contrôle du byte-level
+                                let split_idx = prev_text.len();
+                                if new_text.is_char_boundary(split_idx) {
+                                    new_text[split_idx..].to_string()
+                                } else {
+                                    String::new() 
+                                }
                             } else {
                                 String::new()
                             };
