@@ -8,9 +8,11 @@ Cargo.lock.lock
 
 *.bin
 *.safetensors
+*.txt
 *.onnx
 /models/
 /weights/
+/data
 
 .workspace
 .vscode/
