@@ -6,10 +6,11 @@ mod backend;
 mod api;
 
 use orchestrator::ZildaOrchestrator;
-use backend::ZildaMoeBackend;
+use backend::Config;
+use backend::loader::load_safetensors_model;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use candle_core::Device; // <-- Ajout de l'import Device pour Candle
+use candle_core::Device; 
 
 // --- IMPORTS POUR LE BYTE-LEVEL ---
 use tokenizers::pre_tokenizers::byte_level::ByteLevel as PreByteLevel;
@@ -31,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tokenizer = tokenizers::Tokenizer::new(bpe);
 
-    // Ta configuration Byte-Level personnalisée
+    // Configuration Byte-Level personnalisée
     tokenizer.with_pre_tokenizer(Some(PreByteLevel::default()));
     tokenizer.with_decoder(Some(DecByteLevel::default()));
 
@@ -42,23 +43,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block_size = 16;
 
     // --- CONFIGURATION CANDLE & BACKEND QUANTIFIÉ ---
-    // 1. Choix du device (Cpu par défaut, bascule sur Cuda si tu as configuré les features)
+    // 1. Choix du device
     let device = Device::Cpu; 
     
-    // 2. Changement d'extension pour correspondre au loader GGUF quantifié
+    // 2. Fichier des poids
     let weights_path = "../data/muntu_pretrained.safetensors"; 
     
-    // 3. Initialisation via la méthode de chargement dédiée
-    // Dans main.rs
-    let backend = Arc::new(Mutex::new(ZildaMoeBackend::load(
-        weights_path, 
-        &device, 
-        4,   // num_layers
-        4,   // num_experts
-        12,  // num_heads (au lieu de 32)
-        64,  // head_dim (au lieu de 128)
-        2    // num_experts_per_tok
-    )?));
+    // 3. Configuration du modèle
+    let config = Config {
+        num_hidden_layers: 4,
+        num_attention_heads: 12,
+        head_dim: 64,
+        ..Default::default()
+    };
+
+    // 4. Initialisation via la méthode de chargement dédiée
+    let backend_instance = load_safetensors_model(weights_path, &device, &config)?;
+    let backend = Arc::new(Mutex::new(backend_instance));
     
     // --- PILOTAGE DE L'ORCHESTRATEUR ---
     let (orchestrator, rx_queue) = ZildaOrchestrator::new(total_blocks, block_size, Arc::clone(&tokenizer));

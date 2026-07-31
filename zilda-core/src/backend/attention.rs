@@ -1,8 +1,8 @@
-use candle_core::{Result, Tensor};
+use candle_core::{Result, Tensor, D};
 use std::collections::HashMap;
 use crate::memory::KVCacheManager;
 
-#[derive(Clone)] // <--- Corriquet de l'erreur E0277
+#[derive(Clone)]
 pub struct MultiHeadAttention {
     q_proj: Tensor,
     k_proj: Tensor,
@@ -30,7 +30,7 @@ impl MultiHeadAttention {
             head_dim,
         }
     }
-    
+
     pub fn forward(
         &self,
         hidden_states: &Tensor,
@@ -39,32 +39,42 @@ impl MultiHeadAttention {
         cache_manager: &KVCacheManager,
         vram_kv_store: &mut HashMap<usize, (Tensor, Tensor)>,
     ) -> Result<Tensor> {
-        // 1. Projections linéaires initiales via matmul
-        let q = hidden_states.matmul(&self.q_proj)?;
-        let mut k = hidden_states.matmul(&self.k_proj)?;
-        let mut v = hidden_states.matmul(&self.v_proj)?;
+        let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
-        // 2. Récupération et mise à jour du KV Cache via la table de pages
+        // 1. Projections linéaires initiales
+        let q = hidden_states.matmul(&self.q_proj.t()?)?;
+        let k = hidden_states.matmul(&self.k_proj.t()?)?;
+        let v = hidden_states.matmul(&self.v_proj.t()?)?;
+
+        // Redimensionnement
+        let q = q.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let mut k = k.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let mut v = v.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+
+        // 2. Gestion du KV Cache 
         if let Some(allocated_blocks) = cache_manager.table_de_pages.get(request_id) {
-            // Pour simplifier l'indexation par couche, on combine l'index du bloc et de la couche
             if let Some(&base_block_id) = allocated_blocks.first() {
                 let physical_layer_key = base_block_id * 1000 + layer_idx;
-                
+
                 if let Some((past_k, past_v)) = vram_kv_store.get(&physical_layer_key) {
-                    k = Tensor::cat(&[past_k, &k], 0)?;
-                    v = Tensor::cat(&[past_v, &v], 0)?;
+                    k = Tensor::cat(&[past_k, &k], 2)?;
+                    v = Tensor::cat(&[past_v, &v], 2)?;
                 }
                 vram_kv_store.insert(physical_layer_key, (k.clone(), v.clone()));
             }
         }
 
-        // 3. Produit scalaire de l'attention (Scaled Dot-Product)
+        // 3. Scaled Dot-Product Attention
         let scale = 1.0 / ((self.head_dim as f64).sqrt());
-        let scores = q.matmul(&k.t()?)?.affine(scale, 0.0)?;
-        let attention_weights = candle_nn::ops::softmax(&scores, candle_core::D::Minus1)?;
+        let scores = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
+        let attention_weights = candle_nn::ops::softmax(&scores, D::Minus1)?;
+        
         let context = attention_weights.matmul(&v)?;
 
+        // Reprojection vers la dimension cachée 
+        let context = context.transpose(1, 2)?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
+
         // 4. Projection de sortie finale
-        context.matmul(&self.out_proj)
+        context.matmul(&self.out_proj.t()?)
     }
 }

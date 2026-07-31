@@ -56,6 +56,11 @@ impl KVCacheManager {
         }
     }
 
+    /// Renvoie la liste des identifiants de blocs attribués à une requête
+    pub fn get_assigned_blocks(&self, request_id: &str) -> Option<&Vec<usize>> {
+        self.table_de_pages.get(request_id)
+    }
+
     pub fn get_memory_usage(&self) -> f32 {
         let blocs_occupes = self.total_blocks - self.free_blocks.len();
         (blocs_occupes as f32 / self.total_blocks as f32) * 100.0
