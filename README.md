@@ -1,4 +1,4 @@
-Zilda is an asynchronous inference engine written in **Rust**, optimized for executing **Mixture of Experts (MoE)** models. It relies on the `candle-core` framework for native execution without Python overhead.
+This is an asynchronous inference engine written in **Rust**, optimized for executing **Mixture of Experts (MoE)** models. It relies on the `candle-core` framework for native execution without Python overhead.
 
 ### Technical Architecture
 
@@ -15,8 +15,6 @@ Zilda is an asynchronous inference engine written in **Rust**, optimized for exe
 *   **API Server:** `tokio` (async runtime), `axum`.
 *   **Serialization:** `safetensors`.
 
----
-
 ### Current State (Proof of Concept)
 
 Zilda is currently a functional **PoC**. The basic infrastructure is validated, but the mathematical logic (tensor alignment) is undergoing debugging.
@@ -26,8 +24,6 @@ Zilda is currently a functional **PoC**. The basic infrastructure is validated, 
 *   Asynchronous pipeline and request queue.
 *   Weight loading via Mmap.
 *   Integrated BPE tokenizer.
-
----
 
 ### Roadmap
 
