@@ -3,7 +3,8 @@ use axum::{
     http::StatusCode,
     response::sse::{Event, Sse},
     routing::post,
-    Json, Router,
+    Router,
+    body::Bytes,
 };
 use futures_util::stream::Stream;
 use serde::Deserialize;
@@ -14,8 +15,11 @@ use crate::orchestrator::InferenceRequest;
 #[derive(Deserialize)]
 pub struct ApiPromptRequest {
     pub prompt: String,
-    #[serde(default)]
+    #[serde(default, alias = "stream")]
     pub _stream: Option<bool>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub repetition_penalty: Option<f32>,
 }
 
 pub struct ApiState {
@@ -39,8 +43,17 @@ pub async fn start_api_server(port: u16, tx_queue: mpsc::Sender<InferenceRequest
 
 async fn handle_chat_completion(
     State(state): State<Arc<ApiState>>,
-    Json(payload): Json<ApiPromptRequest>,
+    body: Bytes,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    // 1. Convertir les bytes en String et supprimer le BOM UTF-8 s'il existe
+    let body_str = std::str::from_utf8(&body)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Payload non UTF-8 valide".to_string()))?;
+    let clean_body = body_str.trim_start_matches('\u{feff}');
+
+    // 2. Parser le JSON nettoyé
+    let payload: ApiPromptRequest = serde_json::from_str(clean_body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to parse the request body as JSON: {}", e)))?;
+
     if payload.prompt.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Le prompt est vide.".to_string()));
     }
@@ -53,6 +66,9 @@ async fn handle_chat_completion(
         prompt: payload.prompt,
         estimated_tokens: 32,
         tx_token,
+        temperature: payload.temperature,
+        top_p: payload.top_p,
+        repetition_penalty: payload.repetition_penalty,
     };
 
     if state.tx_queue.send(internal_request).await.is_err() {
