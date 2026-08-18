@@ -13,7 +13,6 @@ impl Sampler {
     ) -> u32 {
         let mut logits_clone = logits.to_vec();
 
-        // 1. Repetition Penalty
         if repetition_penalty != 1.0 && !generated_tokens.is_empty() {
             let unique_tokens: HashSet<&u32> = generated_tokens.iter().collect();
             for &&token_id in &unique_tokens {
@@ -29,7 +28,6 @@ impl Sampler {
             }
         }
 
-        // 2. Greedy Sampling (Temperature <= 0)
         if temperature <= 0.0 {
             return logits_clone
                 .iter()
@@ -39,7 +37,6 @@ impl Sampler {
                 .unwrap_or(0);
         }
 
-        // 3. Scaling par la température
         for logit in logits_clone.iter_mut() {
             *logit /= temperature;
         }
@@ -47,13 +44,11 @@ impl Sampler {
         let mut indexed_logits: Vec<(usize, f32)> = logits_clone.into_iter().enumerate().collect();
         indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Softmax
         let max_logit = indexed_logits[0].1;
         let exp_logits: Vec<f32> = indexed_logits.iter().map(|(_, l)| (l - max_logit).exp()).collect();
         let sum_exp: f32 = exp_logits.iter().sum();
         let mut probs: Vec<f32> = exp_logits.iter().map(|&e| e / sum_exp).collect();
 
-        // 4. Top-P (Nucleus Sampling)
         if top_p > 0.0 && top_p < 1.0 {
             let mut cumulative_prob = 0.0;
             let mut cutoff_idx = probs.len();
@@ -80,7 +75,6 @@ impl Sampler {
             }
         }
 
-        // 5. Sampling pondéré
         let mut rng = rand::rng();
         if let Ok(dist) = WeightedIndex::new(&probs) {
             let sampled_idx = dist.sample(&mut rng);

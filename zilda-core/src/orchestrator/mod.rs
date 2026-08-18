@@ -44,7 +44,6 @@ impl ZildaOrchestrator {
         let mut active_batch: Vec<ActiveQuery> = Vec::new();
 
         loop {
-            // 1. Ingestion des nouvelles requêtes
             while let Ok(req) = rx_queue.try_recv() {
                 let tokens = tokenizer
                     .encode(req.prompt.clone(), true)
@@ -64,7 +63,6 @@ impl ZildaOrchestrator {
                 continue;
             }
 
-            // 2. Traitement du batch sous verrou
             let mut tokens_to_send: Vec<(mpsc::Sender<String>, String, usize)> = Vec::new();
             let mut finished_indices: Vec<usize> = Vec::new();
 
@@ -116,16 +114,13 @@ impl ZildaOrchestrator {
                         }
                     }
                 }
-            } // Verrous libérés ici
-
-            // 3. Envoi des fragments générés hors-verrou
+            } 
             for (tx, text, idx) in tokens_to_send {
                 if tx.send(text).await.is_err() && !finished_indices.contains(&idx) {
                     finished_indices.push(idx);
                 }
             }
 
-            // 4. Nettoyage de la mémoire pour les requêtes terminées
             if !finished_indices.is_empty() {
                 finished_indices.sort_unstable();
                 finished_indices.dedup();

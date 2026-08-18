@@ -25,7 +25,6 @@ pub struct ActiveQuery {
 }
 
 impl ActiveQuery {
-    /// Construit une requête active avec les valeurs par défaut pour le sampling
     pub fn from_request(req: InferenceRequest, prompt_tokens: Vec<u32>) -> Self {
         Self {
             request_id: req.request_id,
@@ -38,9 +37,6 @@ impl ActiveQuery {
         }
     }
 
-    /// Exécute l'étape de forward : 
-    /// - Passe tous les tokens du prompt (Prefill) si aucun token n'a encore été généré.
-    /// - Passe uniquement le dernier token généré (Decode) sinon.
     pub fn step_forward(
         &mut self,
         model: &mut ZildaMoeBackend,

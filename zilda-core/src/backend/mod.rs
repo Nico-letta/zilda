@@ -1,6 +1,5 @@
 pub mod attention;
 pub mod block;
-pub mod loader;
 pub mod moe;
 
 use candle_core::{Result, Tensor};
@@ -10,12 +9,24 @@ use std::collections::HashMap;
 use self::block::TransformerBlock;
 use crate::memory::KVCacheManager;
 
-#[derive(Clone, Debug)]
+pub fn matmul_linear(x: &Tensor, weight_t: &Tensor) -> Result<Tensor> {
+    match x.dims() {
+        [b, s, h] => {
+            let x_2d = x.reshape((*b * *s, *h))?;
+            let res_2d = x_2d.matmul(weight_t)?;
+            let out_dim = weight_t.dim(1)?;
+            res_2d.reshape((*b, *s, out_dim))
+        }
+        _ => x.matmul(weight_t),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub num_hidden_layers: usize,
     pub hidden_size: usize,
     pub num_attention_heads: usize,
     pub head_dim: usize,
+    pub num_hidden_layers: usize,
     pub vocab_size: usize,
     pub max_position_embeddings: usize,
 }
@@ -40,8 +51,10 @@ pub struct ZildaMoeBackend {
     pub ln_f_weight: Tensor,
     pub ln_f_bias: Tensor,
     pub blocks: Vec<TransformerBlock>,
-    pub vram_kv_store: HashMap<usize, (Tensor, Tensor)>,
+    pub vram_kv_store: HashMap<String, (Tensor, Tensor)>,
 }
+
+pub type Model = ZildaMoeBackend;
 
 impl ZildaMoeBackend {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
@@ -50,14 +63,12 @@ impl ZildaMoeBackend {
             config.num_hidden_layers, config.hidden_size
         );
 
-        // 1. Embedding de tokens
         let embed_tokens = vb
             .pp("embedding")
             .pp("token_embedding")
             .get((config.vocab_size, config.hidden_size), "weight")
             .or_else(|_| vb.get((config.vocab_size, config.hidden_size), "embedding.token_embedding.weight"))?;
 
-        // 2. Embedding de positions (Optionnel)
         let pos_embeds = vb
             .pp("embedding")
             .pp("position_embedding")
@@ -65,19 +76,16 @@ impl ZildaMoeBackend {
             .or_else(|_| vb.get((config.max_position_embeddings, config.hidden_size), "embedding.position_embedding.weight"))
             .ok();
 
-        // 3. LayerNorm finale (ln_f)
         let ln_f_weight = vb.get(config.hidden_size, "ln_f.weight")
             .or_else(|_| vb.pp("ln_f").get(config.hidden_size, "weight"))?;
         let ln_f_bias = vb.get(config.hidden_size, "ln_f.bias")
             .or_else(|_| vb.pp("ln_f").get(config.hidden_size, "bias"))?;
 
-        // 4. Head de sortie (Réutilisation des poids d'embeddings)
         let lm_head = vb
             .pp("lm_head")
             .get((config.vocab_size, config.hidden_size), "weight")
             .unwrap_or_else(|_| embed_tokens.clone());
 
-        // 5. Blocs Transformer
         let mut blocks = Vec::with_capacity(config.num_hidden_layers);
         let vb_layers = vb.pp("blocks");
 
@@ -105,34 +113,27 @@ impl ZildaMoeBackend {
         token_id: u32,
         request_id: &str,
         manager: &KVCacheManager,
+        pos: usize,
     ) -> Result<Tensor> {
         let device = self.embed_tokens.device();
         let input_tensor = Tensor::new(&[token_id], device)?;
-
-        // Lookup de l'embedding de token -> Shape [1, 1, hidden_size]
         let mut hidden_states = self.embed_tokens.index_select(&input_tensor, 0)?.unsqueeze(0)?;
 
-        // Passage à travers les 12 blocs Transformer
+        if let Some(ref pos_embeds) = self.pos_embeds {
+            let pos_tensor = pos_embeds.narrow(0, pos, 1)?;
+            hidden_states = hidden_states.broadcast_add(&pos_tensor)?;
+        }
+
         for block in self.blocks.iter() {
             hidden_states = block.forward(&hidden_states, request_id, manager, &mut self.vram_kv_store)?;
         }
 
-        // LayerNorm finale avant la projection des logits
         let hidden_2d = hidden_states.squeeze(0)?;
         let norm_hidden = candle_nn::ops::layer_norm(&hidden_2d, &self.ln_f_weight, &self.ln_f_bias, 1e-5)?;
-
-        // Projection vers le vocabulaire -> Shape [1, vocab_size]
         norm_hidden.matmul(&self.lm_head.t()?)
     }
 
-    pub fn free_request_kv(&mut self, request_id: &str, manager: &KVCacheManager) {
-        if let Some(blocks) = manager.get_assigned_blocks(request_id) {
-            for &block_id in blocks {
-                for layer_idx in 0..100 {
-                    let physical_layer_key = block_id * 1000 + layer_idx;
-                    self.vram_kv_store.remove(&physical_layer_key);
-                }
-            }
-        }
+    pub fn free_request_kv(&mut self, request_id: &str, _manager: &KVCacheManager) {
+        self.vram_kv_store.retain(|key, _| !key.starts_with(request_id));
     }
 }

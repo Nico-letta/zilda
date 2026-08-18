@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct CacheBlock {
@@ -56,7 +55,6 @@ impl KVCacheManager {
         }
     }
 
-    /// Renvoie la liste des identifiants de blocs attribués à une requête
     pub fn get_assigned_blocks(&self, request_id: &str) -> Option<&Vec<usize>> {
         self.table_de_pages.get(request_id)
     }
@@ -64,5 +62,11 @@ impl KVCacheManager {
     pub fn get_memory_usage(&self) -> f32 {
         let blocs_occupes = self.total_blocks - self.free_blocks.len();
         (blocs_occupes as f32 / self.total_blocks as f32) * 100.0
+    }
+}
+
+impl Default for KVCacheManager {
+    fn default() -> Self {
+        Self::new(1024, 16) 
     }
 }

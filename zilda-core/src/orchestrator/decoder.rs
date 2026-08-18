@@ -3,7 +3,6 @@ use tokenizers::Tokenizer;
 pub struct StreamDecoder;
 
 impl StreamDecoder {
-    /// Décode uniquement le nouveau morceau de texte produit par le dernier token ajouté
     pub fn decode_next(tokenizer: &Tokenizer, tokens: &[u32]) -> String {
         if tokens.is_empty() {
             return String::new();
