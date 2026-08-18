@@ -1,40 +1,44 @@
 use candle_core::{Result, Tensor, D};
+use candle_nn::VarBuilder;
 use std::collections::HashMap;
 use crate::memory::KVCacheManager;
+use crate::backend::Config;
 
 #[derive(Clone)]
-pub struct MultiHeadAttention {
-    q_proj: Tensor,
-    k_proj: Tensor,
-    v_proj: Tensor,
-    out_proj: Tensor,
-    num_heads: usize,
-    head_dim: usize,
+pub struct Attention {
+    pub q_proj: Tensor,
+    pub k_proj: Tensor,
+    pub v_proj: Tensor,
+    pub out_proj: Tensor,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub layer_idx: usize,
 }
 
-impl MultiHeadAttention {
-    pub fn new(
-        q_proj: Tensor,
-        k_proj: Tensor,
-        v_proj: Tensor,
-        out_proj: Tensor,
-        num_heads: usize,
-        head_dim: usize,
-    ) -> Self {
-        Self {
+impl Attention {
+    pub fn load(vb: VarBuilder, config: &Config, layer_idx: usize) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+
+        let q_proj = vb.get((hidden_size, hidden_size), "q_proj.weight")?;
+        let k_proj = vb.get((hidden_size, hidden_size), "k_proj.weight")?;
+        let v_proj = vb.get((hidden_size, hidden_size), "v_proj.weight")?;
+        let out_proj = vb.get((hidden_size, hidden_size), "o_proj.weight")
+            .or_else(|_| vb.get((hidden_size, hidden_size), "out_proj.weight"))?;
+
+        Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             out_proj,
-            num_heads,
-            head_dim,
-        }
+            num_heads: config.num_attention_heads,
+            head_dim: config.head_dim,
+            layer_idx,
+        })
     }
 
     pub fn forward(
         &self,
         hidden_states: &Tensor,
-        layer_idx: usize,
         request_id: &str,
         cache_manager: &KVCacheManager,
         vram_kv_store: &mut HashMap<usize, (Tensor, Tensor)>,
@@ -54,7 +58,7 @@ impl MultiHeadAttention {
         // 2. Gestion du KV Cache 
         if let Some(allocated_blocks) = cache_manager.table_de_pages.get(request_id) {
             if let Some(&base_block_id) = allocated_blocks.first() {
-                let physical_layer_key = base_block_id * 1000 + layer_idx;
+                let physical_layer_key = base_block_id * 1000 + self.layer_idx;
 
                 if let Some((past_k, past_v)) = vram_kv_store.get(&physical_layer_key) {
                     k = Tensor::cat(&[past_k, &k], 2)?;

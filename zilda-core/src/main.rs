@@ -1,81 +1,70 @@
-#![allow(dead_code)]
-
-mod memory;
-mod orchestrator;
-mod backend;
-mod api;
-
-use orchestrator::ZildaOrchestrator;
-use backend::Config;
-use backend::loader::load_safetensors_model;
+use candle_core::Device;
+use tokenizers::Tokenizer;
+use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use candle_core::Device; 
 
-// --- IMPORTS POUR LE BYTE-LEVEL ---
-use tokenizers::pre_tokenizers::byte_level::ByteLevel as PreByteLevel;
-use tokenizers::decoders::byte_level::ByteLevel as DecByteLevel;
+pub mod backend;
+pub mod memory;
+pub mod orchestrator;
+
+use crate::backend::{Config, loader::ModelLoader};
+use crate::orchestrator::ZildaOrchestrator;
+
+/// Résout dynamiquement le chemin des poids Safetensors.
+fn resolve_weights_path() -> PathBuf {
+    if let Ok(path) = env::var("MODEL_PATH") {
+        return PathBuf::from(path);
+    }
+    let root_path = PathBuf::from("data/muntu_pretrained.safetensors");
+    if root_path.exists() {
+        return root_path;
+    }
+    PathBuf::from("../data/muntu_pretrained.safetensors")
+}
+
+/// Résout dynamiquement le chemin du tokenizer JSON.
+fn resolve_tokenizer_path() -> PathBuf {
+    if let Ok(path) = env::var("TOKENIZER_PATH") {
+        return PathBuf::from(path);
+    }
+    let root_path = PathBuf::from("data/tokenizer.json");
+    if root_path.exists() {
+        return root_path;
+    }
+    PathBuf::from("../data/tokenizer.json")
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("====================================================");
-    println!("     SERVEUR DE STREAMING ASYNCHRONE ZILDA          ");
-    println!("====================================================");
+    let device = Device::Cpu;
+    let config = Config::default();
 
-    println!("[Système] Initialisation du tokenizer BPE MUNTU...");
-    let vocab_path = "../data/vocab.json";
-    let merges_path = "../data/merges.txt";
+    // 1. Chargement du modèle backend
+    let weights_path = resolve_weights_path();
+    println!("[Zilda] Recherche du modèle sur : {:?}", weights_path);
 
-    let bpe = tokenizers::models::bpe::BPE::from_file(vocab_path, merges_path)
-        .build()
-        .map_err(|e| format!("Erreur lors de la lecture des fichiers BPE MUNTU : {}", e))?;
+    let _backend = Arc::new(Mutex::new(
+        ModelLoader::load_from_safetensors(&weights_path, &config, &device)?
+    ));
 
-    let mut tokenizer = tokenizers::Tokenizer::new(bpe);
-
-    // Configuration Byte-Level personnalisée
-    tokenizer.with_pre_tokenizer(Some(PreByteLevel::default()));
-    tokenizer.with_decoder(Some(DecByteLevel::default()));
-
+    // 2. Chargement du Tokenizer
+    let tokenizer_path = resolve_tokenizer_path();
+    println!("[Zilda] Recherche du tokenizer sur : {:?}", tokenizer_path);
+    
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| format!("Impossible de charger le tokenizer ({:?}): {}", tokenizer_path, e))?;
     let tokenizer = Arc::new(tokenizer);
-    println!("[Système] Tokenizer BPE chargé avec succès. Taille du vocabulaire : {}", tokenizer.get_vocab_size(true));
 
-    let total_blocks = 40;
-    let block_size = 16;
+    // 3. Configuration du KV Cache Manager
+    let total_blocks = 128; // Nombre de blocs mémoire alloués
+    let block_size = 16;    // Nombre de tokens par bloc
 
-    // --- CONFIGURATION CANDLE & BACKEND QUANTIFIÉ ---
-    // 1. Choix du device
-    let device = Device::Cpu; 
-    
-    // 2. Fichier des poids
-    let weights_path = "../data/muntu_pretrained.safetensors"; 
-    
-    // 3. Configuration du modèle
-    let config = Config {
-        num_hidden_layers: 4,
-        num_attention_heads: 12,
-        head_dim: 64,
-        ..Default::default()
-    };
+    // 4. Instanciation de l'Orchestrateur
+    let (_orchestrator, _rx) = ZildaOrchestrator::new(total_blocks, block_size, tokenizer);
 
-    // 4. Initialisation via la méthode de chargement dédiée
-    let backend_instance = load_safetensors_model(weights_path, &device, &config)?;
-    let backend = Arc::new(Mutex::new(backend_instance));
-    
-    // --- PILOTAGE DE L'ORCHESTRATEUR ---
-    let (orchestrator, rx_queue) = ZildaOrchestrator::new(total_blocks, block_size, Arc::clone(&tokenizer));
-    let orchestrator = Arc::new(orchestrator);
-
-    let cache_manager_clone = Arc::clone(&orchestrator.cache_manager);
-    let backend_clone = Arc::clone(&backend);
-    let tokenizer_clone = Arc::clone(&tokenizer);
-    
-    tokio::spawn(async move {
-        ZildaOrchestrator::run_engine_loop(cache_manager_clone, backend_clone, tokenizer_clone, rx_queue).await;
-    });
-
-    let tx_queue_clone = orchestrator.tx_queue.clone();
-    println!("[Système] Lancement du service API... ");
-    api::start_api_server(9999, tx_queue_clone).await;
+    println!("[Zilda] Orchestrateur initialisé avec succès sur : {:?}", device);
 
     Ok(())
 }
