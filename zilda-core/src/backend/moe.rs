@@ -58,13 +58,13 @@ impl Expert {
 pub struct MoEBlock {
     pub gate: Tensor,
     pub experts: Vec<Expert>,
-    pub num_experts_per_tok: usize,
+    pub _num_experts_per_tok: usize,
 }
 
 impl MoEBlock {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
         let num_experts = 4;
-        let num_experts_per_tok = 2;
+        let _num_experts_per_tok = 2;
 
         let gate = vb
             .get((num_experts, config.hidden_size), "router.weight")
@@ -81,7 +81,7 @@ impl MoEBlock {
         Ok(Self {
             gate,
             experts,
-            num_experts_per_tok,
+            _num_experts_per_tok,
         })
     }
 

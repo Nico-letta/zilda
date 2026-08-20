@@ -1,6 +1,5 @@
 use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
-use std::collections::HashMap;
 
 use crate::backend::attention::MultiHeadAttention;
 use crate::backend::moe::MoEBlock;
@@ -51,17 +50,21 @@ impl TransformerBlock {
         &self,
         x: &Tensor,
         request_id: &str,
-        manager: &KVCacheManager,
-        vram_kv_store: &mut HashMap<String, (Tensor, Tensor)>,
+        kv_manager: &mut KVCacheManager,
+        pos: usize,
     ) -> Result<Tensor> {
         let (b, s, h) = x.dims3()?;
         let x_2d = x.reshape((b * s, h))?;
         let norm1_2d = candle_nn::ops::layer_norm(&x_2d, &self.ln1_weight, &self.ln1_bias, 1e-5)?;
         let norm1 = norm1_2d.reshape((b, s, h))?;
 
-        let attn_out = self
-            .self_attn
-            .forward(&norm1, request_id, manager, vram_kv_store)?;
+        let attn_out = self.self_attn.forward(
+            &norm1,
+            request_id,
+            kv_manager,
+            pos,
+            self.layer_idx,
+        )?;
         let x = x.add(&attn_out)?;
 
         let (b, s, h) = x.dims3()?;
